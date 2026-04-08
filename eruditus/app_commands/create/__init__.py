@@ -83,7 +83,10 @@ class Create(app_commands.Command):
         if not joined:
             await add_discussion_member(thread, discussion, interaction.user)
             await thread.send(
-                f"{interaction.user.mention} requested this paper and joined the discussion."
+                (
+                    f"{interaction.user.mention} requested this paper and joined "
+                    "the discussion."
+                )
             )
 
         verb = "Created" if created else "Updated"

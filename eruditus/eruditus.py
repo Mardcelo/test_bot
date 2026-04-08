@@ -40,7 +40,7 @@ from lib.ctftime.teams import get_ctftime_team_info
 from lib.ctftime.types import CTFTimeDiffType
 from lib.discord_util import get_challenge_category_channel, send_scoreboard
 from lib.eprint.sync import discussion_auto_add_enabled, sync_recent_papers
-from lib.platforms import Platform, PlatformCTX, match_platform
+from lib.platforms import PlatformCTX, match_platform
 from lib.util import (
     country_name,
     derive_colour,
@@ -53,6 +53,7 @@ from lib.util import (
     truncate,
 )
 from msg_components.buttons.discussion import DiscussionButton
+from msg_components.buttons.workon import WorkonButton
 
 
 class Eruditus(discord.Client):

@@ -61,7 +61,10 @@ class _DiscussionButton(discord.ui.Button):
         thread = await _resolve_thread(interaction, discussion["thread_id"])
         if thread is None:
             await interaction.response.send_message(
-                "The discussion thread is missing. Run `/discussion sync` to repair it.",
+                (
+                    "The discussion thread is missing. "
+                    "Run `/discussion sync` to repair it."
+                ),
                 ephemeral=True,
             )
             return
@@ -112,7 +115,10 @@ class _LeaveDiscussionButton(discord.ui.Button):
                 {"$set": {"member_ids": discussion["member_ids"]}},
             )
             await interaction.response.edit_message(
-                content="Removed you from the discussion state, but the thread is missing.",
+                content=(
+                    "Removed you from the discussion state, "
+                    "but the thread is missing."
+                ),
                 view=None,
             )
             return

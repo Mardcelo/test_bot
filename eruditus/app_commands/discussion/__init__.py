@@ -128,7 +128,10 @@ class Discussion(app_commands.Group):
         """Fetch recent ePrint papers from the last 30 days and sync discussions."""
         if not discussion_auto_add_enabled():
             await interaction.response.send_message(
-                "Automatic discussion creation is currently stopped. Use `/discussion start` to resume it.",
+                (
+                    "Automatic discussion creation is currently stopped. "
+                    "Use `/discussion start` to resume it."
+                ),
                 ephemeral=True,
             )
             return
@@ -144,7 +147,10 @@ class Discussion(app_commands.Group):
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             _log.warning("Failed to sync ePrint papers: %s", error)
             await interaction.followup.send(
-                "Failed to fetch recent ePrint papers. Check the network and try again.",
+                (
+                    "Failed to fetch recent ePrint papers. Check the network "
+                    "and try again."
+                ),
                 ephemeral=True,
             )
             return
@@ -234,7 +240,10 @@ class Discussion(app_commands.Group):
             )
             if discussion is None:
                 await interaction.response.send_message(
-                    "The discussion is not available yet. Run `/discussion sync` first.",
+                    (
+                        "The discussion is not available yet. "
+                        "Run `/discussion sync` first."
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -250,7 +259,10 @@ class Discussion(app_commands.Group):
         )
         if thread is None:
             await interaction.response.send_message(
-                "The discussion thread is missing. Run `/discussion sync` to repair it.",
+                (
+                    "The discussion thread is missing. "
+                    "Run `/discussion sync` to repair it."
+                ),
                 ephemeral=True,
             )
             return
@@ -330,7 +342,10 @@ class Discussion(app_commands.Group):
         """Stop automatic creation of new discussions from the ePrint feed."""
         set_discussion_auto_add_enabled(False)
         await interaction.response.send_message(
-            "Automatic discussion creation is now stopped. `/create <eprint_id>` still works.",
+            (
+                "Automatic discussion creation is now stopped. "
+                "`/create <eprint_id>` still works."
+            ),
             ephemeral=True,
         )
 
@@ -359,10 +374,11 @@ class Discussion(app_commands.Group):
         """Add a tracked topic for future auto-created discussions."""
         updated_topics = add_tracked_topic(topic)
         normalized_topic = normalize_topic_name(topic)
+        topics_summary = ", ".join(f"`{item}`" for item in updated_topics)
         await interaction.response.send_message(
             (
                 f"Added tracked topic `{normalized_topic}`.\n"
-                f"Tracked topics now: {', '.join(f'`{item}`' for item in updated_topics)}\n"
+                f"Tracked topics now: {topics_summary}\n"
                 "Run `/discussion sync` to pick up recent matches."
             ),
             ephemeral=True,
@@ -383,10 +399,11 @@ class Discussion(app_commands.Group):
             return
 
         updated_topics = remove_tracked_topic(normalized_topic)
+        topics_summary = ", ".join(f"`{item}`" for item in updated_topics)
         await interaction.response.send_message(
             (
                 f"Removed tracked topic `{normalized_topic}`.\n"
-                f"Tracked topics now: {', '.join(f'`{item}`' for item in updated_topics)}"
+                f"Tracked topics now: {topics_summary}"
             ),
             ephemeral=True,
         )
@@ -508,7 +525,10 @@ class Discussion(app_commands.Group):
 
         summary = [
             f"Purged {purged} discussion(s).",
-            "Purged papers are suppressed from auto-sync until `/create <eprint_id>` is used.",
+            (
+                "Purged papers are suppressed from auto-sync until "
+                "`/create <eprint_id>` is used."
+            ),
         ]
         if failures:
             summary.append(f"Failures: {len(failures)}")
