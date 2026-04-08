@@ -188,7 +188,9 @@ class Eruditus(discord.Client):
             disabled = discussion.get("status") != "active" or bool(
                 paper and paper.get("withdrawn")
             )
-            self.add_view(DiscussionButton(paper_id=discussion["_id"], disabled=disabled))
+            self.add_view(
+                DiscussionButton(paper_id=discussion["_id"], disabled=disabled)
+            )
 
         self.eprint_discussion_sync.start()
 
@@ -317,7 +319,9 @@ class Eruditus(discord.Client):
             try:
                 await event.delete()
             except (discord.Forbidden, discord.HTTPException) as err:
-                logger.warning("Unable to delete legacy CTF event %s: %s", event.name, err)
+                logger.warning(
+                    "Unable to delete legacy CTF event %s: %s", event.name, err
+                )
                 continue
 
             removed += 1

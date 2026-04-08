@@ -139,5 +139,7 @@ def derive_topic_tags(
     return [
         topic
         for topic in topics
-        if topic_matches(topic, title=title, abstract=abstract, category=category, keywords=keywords)
+        if topic_matches(
+            topic, title=title, abstract=abstract, category=category, keywords=keywords
+        )
     ]

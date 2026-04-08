@@ -8,7 +8,11 @@ from discord import app_commands
 from config import DBNAME, DISCUSSION_SUPPRESSION_COLLECTION, MONGO
 from lib.discord_util import add_discussion_member
 from lib.eprint.scraper import fetch_paper_by_id, normalize_eprint_id
-from lib.eprint.sync import ensure_discussion_for_paper, resolve_thread, upsert_paper_record
+from lib.eprint.sync import (
+    ensure_discussion_for_paper,
+    resolve_thread,
+    upsert_paper_record,
+)
 from lib.util import get_paper_info
 from msg_components.buttons.discussion import LeaveDiscussionButton
 
@@ -51,7 +55,9 @@ class Create(app_commands.Command):
             )
             return
 
-        MONGO[DBNAME][DISCUSSION_SUPPRESSION_COLLECTION].delete_one({"_id": normalized_id})
+        MONGO[DBNAME][DISCUSSION_SUPPRESSION_COLLECTION].delete_one(
+            {"_id": normalized_id}
+        )
         paper_doc, _ = upsert_paper_record(fetched_paper or existing_paper)
         discussion, created = await ensure_discussion_for_paper(
             interaction.client, interaction.guild, paper_doc

@@ -84,7 +84,9 @@ class Discussion(app_commands.Group):
         )
         suggestions = []
         for paper in cursor:
-            tags = ",".join(paper.get("iacr_tags") or paper.get("topic_tags") or ["untagged"])
+            tags = ",".join(
+                paper.get("iacr_tags") or paper.get("topic_tags") or ["untagged"]
+            )
             label = truncate(f"{paper['title']} ({paper['_id']}) [{tags}]", 100)
             suggestions.append(Choice(name=label, value=paper["_id"]))
 
@@ -99,10 +101,7 @@ class Discussion(app_commands.Group):
             for topic in get_tracked_topics()
             if not current_normalized or current_normalized in topic
         ]
-        return [
-            Choice(name=truncate(topic, 100), value=topic)
-            for topic in topics[:25]
-        ]
+        return [Choice(name=truncate(topic, 100), value=topic) for topic in topics[:25]]
 
     async def _suppressed_paper_autocomplete(
         self, _: discord.Interaction, current: str

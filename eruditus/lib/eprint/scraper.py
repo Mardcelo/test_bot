@@ -119,7 +119,9 @@ def _parse_page_timestamp(value: str | None) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     return (
-        datetime.fromisoformat(value).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        datetime.fromisoformat(value)
+        .astimezone(timezone.utc)
+        .strftime("%Y-%m-%d %H:%M:%S")
     )
 
 
@@ -309,7 +311,9 @@ def write_snapshot(papers: list[dict[str, Any]], lookback_days: int) -> None:
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as err:
-        _log.warning("Unable to prepare ePrint cache directory %s: %s", cache_path.parent, err)
+        _log.warning(
+            "Unable to prepare ePrint cache directory %s: %s", cache_path.parent, err
+        )
         return
 
     payload = {

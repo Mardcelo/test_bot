@@ -47,7 +47,9 @@ def set_discussion_auto_add_enabled(enabled: bool) -> None:
     )
 
 
-def upsert_paper_record(paper: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def upsert_paper_record(
+    paper: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Persist a paper document and return the stored document plus previous state."""
     existing_paper = MONGO[DBNAME][PAPER_COLLECTION].find_one({"_id": paper["_id"]})
     now = datetime.now(timezone.utc).isoformat()
@@ -65,9 +67,9 @@ def upsert_paper_record(paper: dict[str, Any]) -> tuple[dict[str, Any], dict[str
 def build_thread_name(paper: dict[str, Any]) -> str:
     """Create a Discord-safe thread name for a paper discussion."""
     prefix = "🚫" if paper["withdrawn"] else "📄"
-    slug = sanitize_channel_name(paper["title"])[:90].strip("-") or paper["_id"].replace(
-        "/", "-"
-    )
+    slug = sanitize_channel_name(paper["title"])[:90].strip("-") or paper[
+        "_id"
+    ].replace("/", "-")
     return f"{prefix}-{slug}"[:100]
 
 
@@ -81,7 +83,10 @@ def build_discussion_embed(
 
     links = [f"[Paper]({paper['paper_url']})", f"[PDF]({paper['pdf_url']})"]
     if paper["git_links"]:
-        links.extend(f"[Repo {index + 1}]({link})" for index, link in enumerate(paper["git_links"][:3]))
+        links.extend(
+            f"[Repo {index + 1}]({link})"
+            for index, link in enumerate(paper["git_links"][:3])
+        )
 
     description = truncate(paper["abstract"], 1200)
     if paper["withdrawn"]:
@@ -127,7 +132,9 @@ async def ensure_discussion_feed_channel(guild: discord.Guild) -> discord.TextCh
         channel = guild.get_channel(DISCUSSION_CHANNEL)
         if isinstance(channel, discord.TextChannel):
             return channel
-        raise RuntimeError("DISCUSSION_CHANNEL is set but does not point to a text channel.")
+        raise RuntimeError(
+            "DISCUSSION_CHANNEL is set but does not point to a text channel."
+        )
 
     for channel in guild.text_channels:
         if channel.name == EPRINT_FEED_CHANNEL_NAME:
@@ -200,14 +207,18 @@ async def ensure_discussion_for_paper(
 ) -> tuple[dict[str, Any] | None, bool]:
     """Create or repair the discussion objects for a paper."""
     if paper["withdrawn"]:
-        discussion = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
+        discussion = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one(
+            {"_id": paper["_id"]}
+        )
         if not discussion:
             return None, False
     feed_channel = feed_channel or await ensure_discussion_feed_channel(guild)
 
     existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
     now = datetime.now(timezone.utc).isoformat()
-    thread = await resolve_thread(client, guild, existing["thread_id"] if existing else None)
+    thread = await resolve_thread(
+        client, guild, existing["thread_id"] if existing else None
+    )
     created = existing is None
 
     if thread is None and not paper["withdrawn"]:
@@ -219,7 +230,9 @@ async def ensure_discussion_for_paper(
         await _prime_thread(thread, paper, feed_channel)
 
     if existing:
-        message = await resolve_message(feed_channel, existing.get("announcement_message_id"))
+        message = await resolve_message(
+            feed_channel, existing.get("announcement_message_id")
+        )
     else:
         message = None
 
@@ -291,7 +304,9 @@ async def sync_recent_papers(
     }
 
     for paper in papers:
-        if MONGO[DBNAME][DISCUSSION_SUPPRESSION_COLLECTION].find_one({"_id": paper["_id"]}):
+        if MONGO[DBNAME][DISCUSSION_SUPPRESSION_COLLECTION].find_one(
+            {"_id": paper["_id"]}
+        ):
             stats["skipped"] += 1
             continue
 
@@ -322,7 +337,10 @@ async def sync_recent_papers(
             stats["withdrawn"] += 1
             continue
 
-        if existing_paper is None or existing_paper.get("source_hash") != paper["source_hash"]:
+        if (
+            existing_paper is None
+            or existing_paper.get("source_hash") != paper["source_hash"]
+        ):
             stats["updated"] += 1
 
     _log.info("ePrint sync stats: %s", stats)
