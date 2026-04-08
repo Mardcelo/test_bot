@@ -93,7 +93,11 @@ def build_thread_name(paper: dict[str, Any]) -> str:
 
 
 def build_discussion_embed(
-    paper: dict[str, Any], discussion: dict[str, Any] | None = None
+    paper: dict[str, Any],
+    discussion: dict[str, Any] | None = None,
+    *,
+    include_abstract: bool = True,
+    include_discussion: bool = True,
 ) -> discord.Embed:
     """Build the feed embed for a paper discussion."""
     links = [f"[Paper]({paper['paper_url']})", f"[PDF]({paper['pdf_url']})"]
@@ -103,9 +107,13 @@ def build_discussion_embed(
             for index, link in enumerate(paper["git_links"][:3])
         )
 
-    description = truncate(paper["abstract"], 1200)
-    if paper["withdrawn"]:
-        description = f"**Withdrawn paper.**\n\n{description}"
+    description = None
+    if include_abstract:
+        description = truncate(paper["abstract"], 1200)
+        if paper["withdrawn"]:
+            description = f"**Withdrawn paper.**\n\n{description}"
+    elif paper["withdrawn"]:
+        description = "**Withdrawn paper.**"
 
     embed = discord.Embed(
         title=f"{paper['title']} ({paper['_id']})",
@@ -132,19 +140,33 @@ def build_discussion_embed(
             inline=True,
         )
     embed.add_field(name="Links", value=" | ".join(links), inline=False)
-    embed.add_field(
-        name="Discussion",
-        value=format_discussion_locations(discussion),
-        inline=False,
-    )
+    if include_discussion:
+        embed.add_field(
+            name="Discussion",
+            value=format_discussion_locations(discussion),
+            inline=False,
+        )
     embed.set_footer(text=f"Last modified: {paper['lastmodified']} UTC")
+    return embed
+
+
+def build_thread_context_embed(
+    paper: dict[str, Any], feed_channel: discord.TextChannel
+) -> discord.Embed:
+    """Build the private-thread context message with the paper abstract."""
+    embed = build_discussion_embed(
+        paper,
+        include_abstract=True,
+        include_discussion=False,
+    )
+    embed.add_field(name="Feed Channel", value=feed_channel.mention, inline=False)
     return embed
 
 
 async def ensure_discussion_feed_channel(guild: discord.Guild) -> discord.TextChannel:
     """Resolve or create the feed channel used for paper announcements."""
     if DISCUSSION_CHANNEL:
-        channel = guild.get_channel(DISCUSSION_CHANNEL)
+        channel = await resolve_guild_channel(guild, DISCUSSION_CHANNEL)
         if isinstance(channel, discord.TextChannel):
             return channel
         raise RuntimeError(
@@ -162,14 +184,14 @@ async def ensure_discussion_feed_channel(guild: discord.Guild) -> discord.TextCh
     )
 
 
-def ensure_discussion_forum_channel(
+async def ensure_discussion_forum_channel(
     guild: discord.Guild,
 ) -> discord.ForumChannel | None:
     """Resolve the optional forum channel used to mirror paper discussions."""
     if DISCUSSION_FORUM_CHANNEL is None:
         return None
 
-    channel = guild.get_channel(DISCUSSION_FORUM_CHANNEL)
+    channel = await resolve_guild_channel(guild, DISCUSSION_FORUM_CHANNEL)
     if isinstance(channel, discord.ForumChannel):
         return channel
 
@@ -203,6 +225,25 @@ async def resolve_thread(
     return fetched if isinstance(fetched, discord.Thread) else None
 
 
+async def resolve_guild_channel(
+    guild: discord.Guild, channel_id: int | None
+) -> discord.abc.GuildChannel | None:
+    """Fetch a guild channel by ID, using cache first."""
+    if not channel_id:
+        return None
+
+    channel = guild.get_channel(channel_id)
+    if isinstance(channel, discord.abc.GuildChannel):
+        return channel
+
+    try:
+        fetched = await guild.fetch_channel(channel_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+    return fetched if isinstance(fetched, discord.abc.GuildChannel) else None
+
+
 async def resolve_message(
     feed_channel: discord.TextChannel, message_id: int | None
 ) -> discord.Message | None:
@@ -229,20 +270,52 @@ async def resolve_thread_message(
         return None
 
 
-async def _prime_thread(
-    thread: discord.Thread, paper: dict[str, Any], feed_channel: discord.TextChannel
-) -> None:
-    """Send the initial thread context message."""
-    await thread.send(
-        "\n".join(
-            [
-                f"Started discussion for **{paper['title']}**.",
-                f"Feed channel: {feed_channel.mention}",
-                f"Paper: {paper['paper_url']}",
-                f"PDF: {paper['pdf_url']}",
-            ]
-        )
-    )
+async def resolve_thread_context_message(
+    thread: discord.Thread, message_id: int | None, bot_user_id: int | None
+) -> discord.Message | None:
+    """Fetch the thread context message, falling back to the first bot post."""
+    message = await resolve_thread_message(thread, message_id)
+    if message is not None or bot_user_id is None:
+        return message
+
+    try:
+        async for candidate in thread.history(limit=10, oldest_first=True):
+            if candidate.author.id == bot_user_id:
+                return candidate
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    return None
+
+
+def _is_old_message_edit_limit(err: discord.HTTPException) -> bool:
+    """Return True when Discord refuses further edits to an old message."""
+    return err.code == 30046
+
+
+async def upsert_thread_context_message(
+    thread: discord.Thread,
+    message: discord.Message | None,
+    *,
+    embed: discord.Embed,
+) -> discord.Message:
+    """Create or update the private-thread context message."""
+    if message is None:
+        return await thread.send(embed=embed)
+
+    try:
+        await message.edit(embed=embed)
+        return message
+    except discord.HTTPException as err:
+        if _is_old_message_edit_limit(err):
+            _log.warning(
+                "Thread context message %s in %s hit Discord's old-message edit "
+                "limit; keeping the existing intro message.",
+                message.id,
+                thread.id,
+            )
+            return message
+        raise
 
 
 def _forum_tag_name(name: str) -> str:
@@ -295,6 +368,36 @@ async def ensure_forum_tags(
     return resolved
 
 
+async def upsert_announcement_message(
+    feed_channel: discord.TextChannel,
+    message: discord.Message | None,
+    *,
+    embed: discord.Embed,
+    view: discord.ui.View,
+) -> discord.Message:
+    """Create or update the feed announcement, recreating it when edits are blocked."""
+    if message is None:
+        return await feed_channel.send(embed=embed, view=view)
+
+    try:
+        await message.edit(embed=embed, view=view)
+        return message
+    except discord.HTTPException as err:
+        if not _is_old_message_edit_limit(err):
+            raise
+
+    _log.warning(
+        "Announcement message %s hit Discord's old-message edit limit; recreating it.",
+        message.id,
+    )
+    replacement = await feed_channel.send(embed=embed, view=view)
+    try:
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+    return replacement
+
+
 async def ensure_discussion_for_paper(
     client: discord.Client,
     guild: discord.Guild,
@@ -309,7 +412,7 @@ async def ensure_discussion_for_paper(
         if not discussion:
             return None, False
     feed_channel = feed_channel or await ensure_discussion_feed_channel(guild)
-    forum_channel = ensure_discussion_forum_channel(guild)
+    forum_channel = await ensure_discussion_forum_channel(guild)
 
     existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
     now = datetime.now(timezone.utc).isoformat()
@@ -327,7 +430,6 @@ async def ensure_discussion_for_paper(
             invitable=False,
             auto_archive_duration=10080,
         )
-        await _prime_thread(thread, paper, feed_channel)
 
     text_discussion = {
         "thread_id": thread.id if thread else None,
@@ -386,26 +488,32 @@ async def ensure_discussion_for_paper(
     else:
         message = None
 
-    if message is None:
-        message = await feed_channel.send(
-            embed=build_discussion_embed(
-                paper,
-                discussion=text_discussion,
-            ),
-            view=DiscussionButton(
-                paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
-            ),
+    message = await upsert_announcement_message(
+        feed_channel,
+        message,
+        embed=build_discussion_embed(
+            paper,
+            discussion=text_discussion,
+            include_abstract=False,
+        ),
+        view=DiscussionButton(
+            paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
+        ),
+    )
+
+    if thread is not None:
+        thread_context_message = await resolve_thread_context_message(
+            thread,
+            existing.get("thread_context_message_id") if existing else None,
+            client.user.id if client.user else None,
+        )
+        thread_context_message = await upsert_thread_context_message(
+            thread,
+            thread_context_message,
+            embed=build_thread_context_embed(paper, feed_channel),
         )
     else:
-        await message.edit(
-            embed=build_discussion_embed(
-                paper,
-                discussion=text_discussion,
-            ),
-            view=DiscussionButton(
-                paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
-            ),
-        )
+        thread_context_message = None
 
     if forum_thread is not None:
         forum_message = forum_message or await resolve_thread_message(
@@ -427,17 +535,32 @@ async def ensure_discussion_for_paper(
                     ),
                 )
             except (discord.Forbidden, discord.HTTPException) as err:
-                _log.warning(
-                    "Unable to update forum starter message %s for %s: %s",
-                    forum_message.id,
-                    paper["_id"],
-                    err,
-                )
+                if _is_old_message_edit_limit(err):
+                    _log.warning(
+                        "Forum starter message %s for %s hit Discord's old-message "
+                        "edit limit; keeping the existing starter message.",
+                        forum_message.id,
+                        paper["_id"],
+                    )
+                else:
+                    _log.warning(
+                        "Unable to update forum starter message %s for %s: %s",
+                        forum_message.id,
+                        paper["_id"],
+                        err,
+                    )
 
     discussion = {
         "_id": paper["_id"],
         "paper_id": paper["_id"],
         "thread_id": thread.id if thread else None,
+        "thread_context_message_id": (
+            thread_context_message.id
+            if thread_context_message
+            else existing.get("thread_context_message_id")
+            if existing
+            else None
+        ),
         "announcement_message_id": message.id,
         "feed_channel_id": feed_channel.id,
         "forum_thread_id": forum_thread.id if forum_thread else None,

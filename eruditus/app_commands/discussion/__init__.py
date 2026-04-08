@@ -28,6 +28,7 @@ from lib.eprint.sync import (
     ensure_discussion_for_paper,
     format_discussion_locations,
     format_topic_tags,
+    resolve_guild_channel,
     resolve_message,
     resolve_thread,
     set_discussion_auto_add_enabled,
@@ -486,7 +487,9 @@ class Discussion(app_commands.Group):
             feed_channel = None
             feed_channel_id = discussion.get("feed_channel_id")
             if feed_channel_id:
-                channel = interaction.guild.get_channel(feed_channel_id)
+                channel = await resolve_guild_channel(
+                    interaction.guild, feed_channel_id
+                )
                 if isinstance(channel, discord.TextChannel):
                     feed_channel = channel
             if feed_channel is None:
@@ -496,14 +499,14 @@ class Discussion(app_commands.Group):
                 feed_channel, discussion.get("announcement_message_id")
             )
 
+            artifact_failures: list[str] = []
             if thread is not None:
                 try:
                     await thread.delete()
                 except discord.NotFound:
                     pass
                 except (discord.Forbidden, discord.HTTPException) as err:
-                    failures.append(f"{paper_id}: thread delete failed ({err})")
-                    continue
+                    artifact_failures.append(f"thread delete failed ({err})")
 
             if forum_thread is not None:
                 try:
@@ -511,8 +514,7 @@ class Discussion(app_commands.Group):
                 except discord.NotFound:
                     pass
                 except (discord.Forbidden, discord.HTTPException) as err:
-                    failures.append(f"{paper_id}: forum post delete failed ({err})")
-                    continue
+                    artifact_failures.append(f"forum post delete failed ({err})")
 
             if message is not None:
                 try:
@@ -520,8 +522,13 @@ class Discussion(app_commands.Group):
                 except discord.NotFound:
                     pass
                 except (discord.Forbidden, discord.HTTPException) as err:
-                    failures.append(f"{paper_id}: announcement delete failed ({err})")
-                    continue
+                    artifact_failures.append(f"announcement delete failed ({err})")
+
+            if artifact_failures:
+                failures.extend(
+                    f"{paper_id}: {failure}" for failure in artifact_failures
+                )
+                continue
 
             MONGO[DBNAME][DISCUSSION_SUPPRESSION_COLLECTION].replace_one(
                 {"_id": paper_id},
