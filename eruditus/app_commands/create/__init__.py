@@ -98,7 +98,13 @@ class Create(app_commands.Command):
         await interaction.followup.send(
             (
                 f"{verb} discussion for `{paper_doc['_id']}`.\n"
-                f"Thread: {thread.mention}.{join_suffix}"
+                f"Private thread: {thread.mention}.\n"
+                + (
+                    f"Forum post: <#{discussion['forum_thread_id']}>.\n"
+                    if discussion.get("forum_thread_id")
+                    else ""
+                )
+                + join_suffix
             ),
             view=LeaveDiscussionButton(paper_id=paper_doc["_id"]),
             ephemeral=True,

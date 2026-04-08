@@ -26,6 +26,7 @@ from lib.eprint.sync import (
     discussion_auto_add_enabled,
     ensure_discussion_feed_channel,
     ensure_discussion_for_paper,
+    format_discussion_locations,
     format_topic_tags,
     resolve_message,
     resolve_thread,
@@ -196,17 +197,13 @@ class Discussion(app_commands.Group):
         lines = []
         for paper in papers:
             discussion = get_discussion_info(_id=paper["_id"])
-            thread_value = (
-                f"<#{discussion['thread_id']}>"
-                if discussion and discussion.get("thread_id")
-                else "pending"
-            )
             lines.append(
                 (
                     f"**{paper['_id']}** {format_topic_tags(paper)} "
                     f"{'withdrawn' if paper['withdrawn'] else 'active'}\n"
                     f"{truncate(paper['title'], 120)}\n"
-                    f"{thread_value} | {paper['paper_url']}"
+                    f"{format_discussion_locations(discussion)}\n"
+                    f"{paper['paper_url']}"
                 )
             )
 
@@ -482,6 +479,9 @@ class Discussion(app_commands.Group):
             thread = await resolve_thread(
                 interaction.client, interaction.guild, discussion.get("thread_id")
             )
+            forum_thread = await resolve_thread(
+                interaction.client, interaction.guild, discussion.get("forum_thread_id")
+            )
 
             feed_channel = None
             feed_channel_id = discussion.get("feed_channel_id")
@@ -503,6 +503,15 @@ class Discussion(app_commands.Group):
                     pass
                 except (discord.Forbidden, discord.HTTPException) as err:
                     failures.append(f"{paper_id}: thread delete failed ({err})")
+                    continue
+
+            if forum_thread is not None:
+                try:
+                    await forum_thread.delete()
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    failures.append(f"{paper_id}: forum post delete failed ({err})")
                     continue
 
             if message is not None:

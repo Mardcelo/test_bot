@@ -99,6 +99,9 @@ COMMIT_HASH = load_revision()
 BOOKMARK_CHANNEL = int(os.getenv("BOOKMARK_CHANNEL"))
 REMINDER_CHANNEL = load_nullable_env_var("REMINDER_CHANNEL", factory=int)
 DISCUSSION_CHANNEL = load_nullable_env_var("DISCUSSION_CHANNEL", factory=int)
+DISCUSSION_FORUM_CHANNEL = load_nullable_env_var(
+    "DISCUSSION_FORUM_CHANNEL", factory=int
+)
 CTFTIME_TEAM_ID = load_nullable_env_var("CTFTIME_TEAM_ID", factory=int)
 CTFTIME_TRACKING_CHANNEL = load_nullable_env_var("CTFTIME_TRACKING_CHANNEL", factory=int)
 CTFTIME_LEADERBOARD_CHANNEL = load_nullable_env_var("CTFTIME_LEADERBOARD_CHANNEL", factory=int)

@@ -8,6 +8,7 @@ from config import (
     DBNAME,
     DISCUSSION_CHANNEL,
     DISCUSSION_COLLECTION,
+    DISCUSSION_FORUM_CHANNEL,
     DISCUSSION_SETTINGS_COLLECTION,
     DISCUSSION_SUPPRESSION_COLLECTION,
     EPRINT_FEED_CHANNEL_NAME,
@@ -19,6 +20,24 @@ from lib.util import sanitize_channel_name, truncate
 from msg_components.buttons.discussion import DiscussionButton
 
 _log = logging.getLogger("discord.eruditus.eprint.sync")
+
+
+def format_discussion_locations(discussion: dict[str, Any] | None = None) -> str:
+    """Render the available discussion entry points for embeds and lists."""
+    if discussion is None:
+        return "Use the button below to join the private thread."
+
+    locations = []
+    if discussion.get("thread_id"):
+        locations.append(f"Private thread: <#{discussion['thread_id']}>")
+    if discussion.get("forum_thread_id"):
+        locations.append(f"Forum post: <#{discussion['forum_thread_id']}>")
+
+    return (
+        "\n".join(locations)
+        if locations
+        else ("Use the button below to join the private thread.")
+    )
 
 
 def format_topic_tags(paper: dict[str, Any]) -> str:
@@ -77,10 +96,6 @@ def build_discussion_embed(
     paper: dict[str, Any], discussion: dict[str, Any] | None = None
 ) -> discord.Embed:
     """Build the feed embed for a paper discussion."""
-    thread_mention = ""
-    if discussion and discussion.get("thread_id"):
-        thread_mention = f"<#{discussion['thread_id']}>"
-
     links = [f"[Paper]({paper['paper_url']})", f"[PDF]({paper['pdf_url']})"]
     if paper["git_links"]:
         links.extend(
@@ -119,7 +134,7 @@ def build_discussion_embed(
     embed.add_field(name="Links", value=" | ".join(links), inline=False)
     embed.add_field(
         name="Discussion",
-        value=thread_mention or "Use the button below to join the private thread.",
+        value=format_discussion_locations(discussion),
         inline=False,
     )
     embed.set_footer(text=f"Last modified: {paper['lastmodified']} UTC")
@@ -145,6 +160,24 @@ async def ensure_discussion_feed_channel(guild: discord.Guild) -> discord.TextCh
         reason="Create the ePrint discussion feed channel.",
         default_auto_archive_duration=10080,
     )
+
+
+def ensure_discussion_forum_channel(
+    guild: discord.Guild,
+) -> discord.ForumChannel | None:
+    """Resolve the optional forum channel used to mirror paper discussions."""
+    if DISCUSSION_FORUM_CHANNEL is None:
+        return None
+
+    channel = guild.get_channel(DISCUSSION_FORUM_CHANNEL)
+    if isinstance(channel, discord.ForumChannel):
+        return channel
+
+    _log.warning(
+        "DISCUSSION_FORUM_CHANNEL=%s is set but does not point to a forum channel.",
+        DISCUSSION_FORUM_CHANNEL,
+    )
+    return None
 
 
 async def resolve_thread(
@@ -183,6 +216,19 @@ async def resolve_message(
         return None
 
 
+async def resolve_thread_message(
+    thread: discord.Thread, message_id: int | None
+) -> discord.Message | None:
+    """Fetch a thread message if it still exists."""
+    if not message_id:
+        return None
+
+    try:
+        return await thread.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
 async def _prime_thread(
     thread: discord.Thread, paper: dict[str, Any], feed_channel: discord.TextChannel
 ) -> None:
@@ -199,6 +245,56 @@ async def _prime_thread(
     )
 
 
+def _forum_tag_name(name: str) -> str:
+    """Normalize a topic tag into a Discord forum-tag label."""
+    normalized = " ".join(str(name).split()).lower()
+    return normalized[:20] or "untagged"
+
+
+async def ensure_forum_tags(
+    forum_channel: discord.ForumChannel,
+    paper: dict[str, Any],
+) -> list[discord.ForumTag]:
+    """Resolve or create the forum tags needed for a paper mirror post."""
+    requested_names = paper.get("topic_tags") or ["untagged"]
+    known_tags = {tag.name.casefold(): tag for tag in forum_channel.available_tags}
+    resolved = []
+
+    for raw_name in requested_names:
+        tag_name = _forum_tag_name(raw_name)
+        if not tag_name or any(tag.name == tag_name for tag in resolved):
+            continue
+
+        tag = known_tags.get(tag_name.casefold())
+        if tag is None:
+            if len(known_tags) >= 20:
+                _log.warning(
+                    "Forum %s reached the 20-tag limit; skipping tag %r.",
+                    forum_channel.id,
+                    tag_name,
+                )
+                continue
+            try:
+                tag = await forum_channel.create_tag(name=tag_name)
+            except (discord.Forbidden, discord.HTTPException) as err:
+                _log.warning(
+                    "Unable to create forum tag %r in %s: %s",
+                    tag_name,
+                    forum_channel.id,
+                    err,
+                )
+                continue
+
+            forum_channel._available_tags[tag.id] = tag
+            known_tags[tag_name.casefold()] = tag
+
+        resolved.append(tag)
+        if len(resolved) == 5:
+            break
+
+    return resolved
+
+
 async def ensure_discussion_for_paper(
     client: discord.Client,
     guild: discord.Guild,
@@ -213,11 +309,15 @@ async def ensure_discussion_for_paper(
         if not discussion:
             return None, False
     feed_channel = feed_channel or await ensure_discussion_feed_channel(guild)
+    forum_channel = ensure_discussion_forum_channel(guild)
 
     existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
     now = datetime.now(timezone.utc).isoformat()
     thread = await resolve_thread(
         client, guild, existing["thread_id"] if existing else None
+    )
+    forum_thread = await resolve_thread(
+        client, guild, existing.get("forum_thread_id") if existing else None
     )
     created = existing is None
 
@@ -229,6 +329,56 @@ async def ensure_discussion_for_paper(
         )
         await _prime_thread(thread, paper, feed_channel)
 
+    text_discussion = {
+        "thread_id": thread.id if thread else None,
+        "forum_thread_id": forum_thread.id if forum_thread else None,
+    }
+
+    if forum_channel is not None:
+        forum_tags = await ensure_forum_tags(forum_channel, paper)
+        forum_message = None
+        if forum_thread is None and not paper["withdrawn"]:
+            try:
+                forum_thread, forum_message = await forum_channel.create_thread(
+                    name=build_thread_name(paper),
+                    embed=build_discussion_embed(paper, discussion=text_discussion),
+                    applied_tags=forum_tags,
+                    view=DiscussionButton(
+                        paper_id=paper["_id"],
+                        disabled=paper["withdrawn"] or thread is None,
+                    ),
+                    auto_archive_duration=10080,
+                    reason="Create the mirrored ePrint forum post.",
+                )
+                text_discussion["forum_thread_id"] = forum_thread.id
+            except (discord.Forbidden, discord.HTTPException) as err:
+                _log.warning(
+                    "Unable to create forum post for %s in %s: %s",
+                    paper["_id"],
+                    forum_channel.id,
+                    err,
+                )
+                forum_thread = None
+        elif forum_thread is not None:
+            try:
+                await forum_thread.edit(
+                    name=build_thread_name(paper),
+                    applied_tags=forum_tags,
+                )
+            except (discord.Forbidden, discord.HTTPException) as err:
+                _log.warning(
+                    "Unable to update forum thread %s for %s: %s",
+                    forum_thread.id,
+                    paper["_id"],
+                    err,
+                )
+
+            forum_message = await resolve_thread_message(
+                forum_thread, existing.get("forum_message_id") if existing else None
+            )
+    else:
+        forum_message = None
+
     if existing:
         message = await resolve_message(
             feed_channel, existing.get("announcement_message_id")
@@ -236,25 +386,53 @@ async def ensure_discussion_for_paper(
     else:
         message = None
 
-    announcement_view = DiscussionButton(
-        paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
-    )
     if message is None:
         message = await feed_channel.send(
             embed=build_discussion_embed(
                 paper,
-                discussion={"thread_id": thread.id if thread else None},
+                discussion=text_discussion,
             ),
-            view=announcement_view,
+            view=DiscussionButton(
+                paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
+            ),
         )
     else:
         await message.edit(
             embed=build_discussion_embed(
                 paper,
-                discussion={"thread_id": thread.id if thread else None},
+                discussion=text_discussion,
             ),
-            view=announcement_view,
+            view=DiscussionButton(
+                paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
+            ),
         )
+
+    if forum_thread is not None:
+        forum_message = forum_message or await resolve_thread_message(
+            forum_thread, existing.get("forum_message_id") if existing else None
+        )
+        if forum_message is not None:
+            try:
+                await forum_message.edit(
+                    embed=build_discussion_embed(
+                        paper,
+                        discussion={
+                            "thread_id": thread.id if thread else None,
+                            "forum_thread_id": forum_thread.id,
+                        },
+                    ),
+                    view=DiscussionButton(
+                        paper_id=paper["_id"],
+                        disabled=paper["withdrawn"] or thread is None,
+                    ),
+                )
+            except (discord.Forbidden, discord.HTTPException) as err:
+                _log.warning(
+                    "Unable to update forum starter message %s for %s: %s",
+                    forum_message.id,
+                    paper["_id"],
+                    err,
+                )
 
     discussion = {
         "_id": paper["_id"],
@@ -262,6 +440,21 @@ async def ensure_discussion_for_paper(
         "thread_id": thread.id if thread else None,
         "announcement_message_id": message.id,
         "feed_channel_id": feed_channel.id,
+        "forum_thread_id": forum_thread.id if forum_thread else None,
+        "forum_message_id": (
+            forum_message.id
+            if forum_message
+            else existing.get("forum_message_id")
+            if existing
+            else None
+        ),
+        "forum_channel_id": (
+            forum_channel.id
+            if forum_channel
+            else existing.get("forum_channel_id")
+            if existing
+            else None
+        ),
         "member_ids": existing["member_ids"] if existing else [],
         "status": "withdrawn" if paper["withdrawn"] else "active",
         "created_at": existing["created_at"] if existing else now,
