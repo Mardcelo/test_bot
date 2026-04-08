@@ -22,7 +22,9 @@ from config import (
     CHALLENGE_COLLECTION,
     CTF_COLLECTION,
     DBNAME,
+    DISCUSSION_COLLECTION,
     MONGO,
+    PAPER_COLLECTION,
     WORKON_COLLECTION,
 )
 from lib.platforms.abc import ChallengeFile, TeamScoreHistory
@@ -600,6 +602,21 @@ def get_all_workon_info(ctf_id: Any, category_name: str) -> list[dict]:
             {"ctf_id": ctf_id, "category": re_ignorecase(category_name)}
         )
     )
+
+
+def get_paper_info(**search_fields: Any) -> Optional[dict]:
+    """Retrieve a paper from the database."""
+    return MONGO[DBNAME][PAPER_COLLECTION].find_one(search_fields)
+
+
+def get_all_papers_info(**search_fields: Any) -> list[dict]:
+    """Retrieve multiple papers from the database."""
+    return list(MONGO[DBNAME][PAPER_COLLECTION].find(search_fields))
+
+
+def get_discussion_info(**search_fields: Any) -> Optional[dict]:
+    """Retrieve a discussion from the database."""
+    return MONGO[DBNAME][DISCUSSION_COLLECTION].find_one(search_fields)
 
 
 def make_form_field_config(name: str, config: dict) -> dict:

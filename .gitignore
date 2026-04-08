@@ -5,3 +5,5 @@
 **/.idea
 **/.vscode
 **/*.pem
+data/eprint/*.json
+eruditus/data/eprint/*.json

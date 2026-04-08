@@ -1,14 +1,18 @@
-version: '2'
-
 services:
   eruditus:
-    build: .
+    build:
+      context: .
+      args:
+        CHATLOGS_REPO: git@github.com:Mardcelo/Discussion_Log.git
     image: eruditus:latest
     container_name: eruditus
     restart: unless-stopped
     environment:
       - DOTNET_CLI_TELEMETRY_OPTOUT=1
       - DOTNET_NOLOGO=true
+    volumes:
+      - ./eruditus/data/eprint:/eruditus/data/eprint
+      - ./eruditus/.env:/eruditus/.env:ro
     depends_on:
       - mongodb
   mongodb:

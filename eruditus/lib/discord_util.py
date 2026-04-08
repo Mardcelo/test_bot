@@ -10,6 +10,7 @@ from config import (
     CHALLENGE_COLLECTION,
     CTF_COLLECTION,
     DBNAME,
+    DISCUSSION_COLLECTION,
     MAX_CONTENT_SIZE,
     MONGO,
     TEAM_NAME,
@@ -184,6 +185,38 @@ async def remove_challenge_worker(
         {"$set": {"players": challenge["players"]}},
     )
     await challenge_thread.remove_user(member)
+
+
+async def add_discussion_member(
+    discussion_thread: discord.Thread,
+    discussion: dict,
+    member: discord.Member,
+) -> None:
+    """Add a member to a discussion thread and persist the membership."""
+    if member.id not in discussion["member_ids"]:
+        discussion["member_ids"].append(member.id)
+
+    MONGO[DBNAME][DISCUSSION_COLLECTION].update_one(
+        {"_id": discussion["_id"]},
+        {"$set": {"member_ids": discussion["member_ids"]}},
+    )
+    await discussion_thread.add_user(member)
+
+
+async def remove_discussion_member(
+    discussion_thread: discord.Thread,
+    discussion: dict,
+    member: discord.Member,
+) -> None:
+    """Remove a member from a discussion thread and persist the membership."""
+    if member.id in discussion["member_ids"]:
+        discussion["member_ids"].remove(member.id)
+
+    MONGO[DBNAME][DISCUSSION_COLLECTION].update_one(
+        {"_id": discussion["_id"]},
+        {"$set": {"member_ids": discussion["member_ids"]}},
+    )
+    await discussion_thread.remove_user(member)
 
 
 async def send_scoreboard(

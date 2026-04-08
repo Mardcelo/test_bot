@@ -60,15 +60,19 @@ RUN chmod a+x /usr/bin/chat_exporter && \
 
 USER user
 
-# Prevent caching the subsequent "git clone" layer.
-# https://github.com/moby/moby/issues/1996#issuecomment-1152463036
-ADD http://date.jsontest.com /etc/builddate
-RUN git clone https://github.com/hfz1337/DiscordChatExporter ~/DiscordChatExporter
+# Prevent caching the subsequent "git clone" layer without relying on a remote URL.
+ARG CACHE_BUST=1
+RUN printf "%s\n" "$CACHE_BUST" > ~/.builddate && \
+    git clone https://github.com/hfz1337/DiscordChatExporter ~/DiscordChatExporter
 
-ARG CHATLOGS_REPO=git@github.com:username/repo
+ARG CHATLOGS_REPO=""
 
-RUN chmod 0600 ~/.ssh/*
-RUN git clone --depth=1 $CHATLOGS_REPO ~/chatlogs
+RUN find ~/.ssh -type f -exec chmod 0600 {} \;
+RUN if [ -n "$CHATLOGS_REPO" ]; then \
+        git clone --depth=1 "$CHATLOGS_REPO" ~/chatlogs; \
+    else \
+        mkdir -p ~/chatlogs; \
+    fi
 RUN git config --global user.email "eruditus@localhost" && \
     git config --global user.name "eruditus"
 

@@ -12,20 +12,9 @@ from bson import ObjectId
 from discord.ext import tasks
 
 import config
-from app_commands.bookmark import Bookmark
-from app_commands.cipher import Cipher
-from app_commands.ctf import CTF
-from app_commands.ctftime import CTFTime
-from app_commands.encoding import Encoding
-from app_commands.export import Export
+from app_commands.create import Create
+from app_commands.discussion import Discussion
 from app_commands.help import Help
-from app_commands.intro import Intro
-from app_commands.report import Report
-from app_commands.request import Request
-from app_commands.revshell import Revshell
-from app_commands.search import Search
-from app_commands.syscalls import Syscalls
-from app_commands.takenote import TakeNote
 from config import (
     CHALLENGE_COLLECTION,
     CTF_COLLECTION,
@@ -34,10 +23,12 @@ from config import (
     CTFTIME_TRACKING_CHANNEL,
     CTFTIME_URL,
     DBNAME,
+    DISCUSSION_COLLECTION,
     GUILD_ID,
     MAX_CONTENT_SIZE,
     MIN_PLAYERS,
     MONGO,
+    PAPER_COLLECTION,
     TEAM_EMAIL,
     TEAM_NAME,
     USER_AGENT,
@@ -48,6 +39,7 @@ from lib.ctftime.misc import ctftime_date_to_datetime
 from lib.ctftime.teams import get_ctftime_team_info
 from lib.ctftime.types import CTFTimeDiffType
 from lib.discord_util import get_challenge_category_channel, send_scoreboard
+from lib.eprint.sync import discussion_auto_add_enabled, sync_recent_papers
 from lib.platforms import Platform, PlatformCTX, match_platform
 from lib.util import (
     country_name,
@@ -60,7 +52,7 @@ from lib.util import (
     sanitize_channel_name,
     truncate,
 )
-from msg_components.buttons.workon import WorkonButton
+from msg_components.buttons.discussion import DiscussionButton
 
 
 class Eruditus(discord.Client):
@@ -74,6 +66,7 @@ class Eruditus(discord.Client):
         self.challenge_puller_is_running = False
         self.previous_team_info = None
         self.previous_leaderboard = None
+        self.legacy_ctf_cleanup_done = False
 
     async def create_ctf(
         self, name: str, live: bool = True, return_if_exists: bool = False
@@ -181,32 +174,23 @@ class Eruditus(discord.Client):
         return ctf
 
     async def setup_hook(self) -> None:
-        # Register commands.
-        self.tree.add_command(Help())
-        self.tree.add_command(Syscalls())
-        self.tree.add_command(Revshell())
-        self.tree.add_command(Encoding())
-        self.tree.add_command(CTFTime())
-        self.tree.add_command(Cipher())
-        self.tree.add_command(Report())
-        self.tree.add_command(Request())
-        self.tree.add_command(Search())
-        self.tree.add_command(Bookmark(), guild=discord.Object(GUILD_ID))
-        self.tree.add_command(TakeNote(), guild=discord.Object(GUILD_ID))
-        self.tree.add_command(CTF(), guild=discord.Object(GUILD_ID))
-        self.tree.add_command(Intro(), guild=discord.Object(GUILD_ID))
-        self.tree.add_command(Export(), guild=discord.Object(GUILD_ID))
+        # Discussion-only mode: clear legacy commands and register the minimal set.
+        guild_object = discord.Object(GUILD_ID)
+        self.tree.clear_commands(guild=None)
+        self.tree.clear_commands(guild=guild_object)
+        self.tree.add_command(Help(), guild=guild_object)
+        self.tree.add_command(Create(), guild=guild_object)
+        self.tree.add_command(Discussion(), guild=guild_object)
 
-        # Restore `workon` buttons.
-        for challenge in MONGO[DBNAME][CHALLENGE_COLLECTION].find({"solved": False}):
-            self.add_view(WorkonButton(oid=challenge["_id"]))
+        # Restore discussion buttons.
+        for discussion in MONGO[DBNAME][DISCUSSION_COLLECTION].find():
+            paper = MONGO[DBNAME][PAPER_COLLECTION].find_one({"_id": discussion["_id"]})
+            disabled = discussion.get("status") != "active" or bool(
+                paper and paper.get("withdrawn")
+            )
+            self.add_view(DiscussionButton(paper_id=discussion["_id"], disabled=disabled))
 
-        self.create_upcoming_events.start()
-        self.ctf_reminder.start()
-        self.scoreboard_updater.start()
-        self.challenge_puller.start()
-        self.ctftime_team_tracking.start()
-        self.ctftime_leaderboard_tracking.start()
+        self.eprint_discussion_sync.start()
 
     async def on_ready(self) -> None:
         for guild in self.guilds:
@@ -216,10 +200,14 @@ class Eruditus(discord.Client):
         await self.tree.sync()
         await self.tree.sync(guild=discord.Object(id=GUILD_ID))
 
+        guild = self.get_guild(GUILD_ID)
+        if guild is not None and not self.legacy_ctf_cleanup_done:
+            await self.cleanup_legacy_ctf_events(guild)
+            self.legacy_ctf_cleanup_done = True
+
         await self.change_presence(
             activity=discord.Game(
-                name=f"/help ~ {config.COMMIT_HASH:.8} ~ {len(Platform) - 1} platforms "
-                "supported"
+                name=f"/discussion list ~ {config.COMMIT_HASH:.8} ~ ePrint discussions"
             )
         )
 
@@ -309,78 +297,33 @@ class Eruditus(discord.Client):
     async def on_scheduled_event_update(
         self, before: discord.ScheduledEvent, after: discord.ScheduledEvent
     ) -> None:
-        # The bot is supposed to be part of a single guild.
-        guild = self.get_guild(GUILD_ID)
+        # Discussion-only mode disables the legacy CTF event automation.
+        return
 
-        event_name = after.name
-        # If an event started (status changes from scheduled to active).
-        if (
-            before.status == discord.EventStatus.scheduled
-            and after.status == discord.EventStatus.active
-        ):
-            # Create the CTF if it wasn't already created and enough people are willing
-            # to play it.
-            users = [user async for user in after.users()]
-            if len(users) < MIN_PLAYERS:
-                return
-            ctf = await self.create_ctf(after.name, live=True, return_if_exists=True)
+    async def cleanup_legacy_ctf_events(self, guild: discord.Guild) -> None:
+        """Delete legacy CTFtime scheduled events so Discord stops notifying users."""
+        try:
+            scheduled_events = await guild.fetch_scheduled_events()
+        except (discord.Forbidden, discord.HTTPException) as err:
+            logger.warning("Unable to fetch scheduled events for cleanup: %s", err)
+            return
 
-            role = await self.add_event_roles_to_members_and_register(
-                guild, ctf, users, after
-            )
+        removed = 0
+        for event in scheduled_events:
+            location = (event.location or "").lower()
+            if "ctftime.org/event/" not in location:
+                continue
 
-            # Ping all participants.
-            ctf_general_channel = discord.utils.get(
-                guild.text_channels,
-                category_id=ctf["guild_category"],
-                name="general",
-            )
-            await ctf_general_channel.send(
-                f"{role.mention} has started!\nGet to work now ⚔️ 🔪 😠 🔨 ⚒️"
-            )
+            try:
+                await event.delete()
+            except (discord.Forbidden, discord.HTTPException) as err:
+                logger.warning("Unable to delete legacy CTF event %s: %s", event.name, err)
+                continue
 
-            # Pull challenges without waiting for scheduled task to execute.
-            self.challenge_puller.restart()
+            removed += 1
 
-            # Substitute the ⏰ in the category channel name with a 🔴 to say that
-            # we're live.
-            category_channel = discord.utils.get(
-                guild.categories, id=ctf["guild_category"]
-            )
-            await category_channel.edit(name=category_channel.name.replace("⏰", "🔴"))
-
-        # If an event ended (status changes from active to ended/completed).
-        elif (
-            before.status == discord.EventStatus.active
-            and after.status == discord.EventStatus.ended
-        ):
-            # Ping players that the CTF ended.
-            ctf = get_ctf_info(name=event_name)
-            if ctf is None:
-                return
-
-            # Ping all participants.
-            role = discord.utils.get(guild.roles, id=ctf["guild_role"])
-            ctf_general_channel = discord.utils.get(
-                guild.text_channels,
-                category_id=ctf["guild_category"],
-                name="general",
-            )
-            await ctf_general_channel.send(
-                f"🏁 {role.mention} time is up! The CTF has ended."
-            )
-
-            # Update status of the CTF.
-            MONGO[DBNAME][CTF_COLLECTION].update_one(
-                {"_id": ctf["_id"]}, {"$set": {"ended": True}}
-            )
-
-            # Substitue the 🔴 in the category channel name with a 🏁 to say that
-            # the CTF ended.
-            category_channel = discord.utils.get(
-                guild.categories, id=ctf["guild_category"]
-            )
-            await category_channel.edit(name=category_channel.name.replace("🔴", "🏁"))
+        if removed:
+            logger.info("Removed %d legacy CTF scheduled events.", removed)
 
     @tasks.loop(minutes=5, reconnect=True)
     async def ctf_reminder(self) -> None:
@@ -393,6 +336,8 @@ class Eruditus(discord.Client):
 
         # The bot is supposed to be part of a single guild.
         guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
 
         if config.REMINDER_CHANNEL is None:
             # Find a public channel where we can send our reminders.
@@ -467,6 +412,8 @@ class Eruditus(discord.Client):
 
         # The bot is supposed to be part of a single guild.
         guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
 
         scheduled_events = {
             scheduled_event.name: scheduled_event.id
@@ -870,9 +817,25 @@ class Eruditus(discord.Client):
 
         # The bot is supposed to be part of a single guild.
         guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
 
         for ctf in MONGO[DBNAME][CTF_COLLECTION].find({"ended": False}):
             await send_scoreboard(ctf, guild=guild)
+
+    @tasks.loop(minutes=config.EPRINT_SYNC_MINUTES, reconnect=True)
+    async def eprint_discussion_sync(self) -> None:
+        """Synchronize recent ePrint papers into discussion threads."""
+        await self.wait_until_ready()
+
+        if not discussion_auto_add_enabled():
+            return
+
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
+
+        await sync_recent_papers(self, guild)
 
     @tasks.loop(minutes=15, reconnect=True)
     async def ctftime_team_tracking(self) -> None:
@@ -1064,6 +1027,11 @@ class Eruditus(discord.Client):
     async def scoreboard_updater_err_handler(self, _: Exception) -> None:
         traceback.print_exc()
         self.scoreboard_updater.restart()
+
+    @eprint_discussion_sync.error
+    async def eprint_discussion_sync_err_handler(self, _: Exception) -> None:
+        traceback.print_exc()
+        self.eprint_discussion_sync.restart()
 
     @challenge_puller.error
     async def challenge_puller_err_handler(self, _: Exception) -> None:

@@ -25,6 +25,7 @@ make its usage as intuitive as possible.
 - Track members' participation in challenges
 - Announcements upon solving a challenge
 - Flag submission from within the Discord guild
+- Sync recent IACR ePrint papers into Discord discussion threads
 
 and more.
 
@@ -53,10 +54,22 @@ _You can check out our [abstract interfaces](eruditus/lib/platforms/abc.py) if y
 Here's a list of the currently supported commands:
 ```
 /help                                                (Show help about the bot usage)
+/create                                              (Create a discussion for any ePrint paper by ID)
 /search                                              (Search for a topic in the CTF write-ups index)
 /request                                             (Request a new feature from the developer)
 /report                                              (Send a bug report to the developer)
 /intro                                               (Show bot instructions for newcomers)
+/discussion sync                                     (Sync recent ePrint papers from the last 30 days)
+/discussion list                                     (List recent paper discussions)
+/discussion join                                     (Join a paper discussion thread)
+/discussion leave                                    (Leave a paper discussion thread)
+/discussion topics                                   (Show the tracked topics)
+/discussion addtopic                                 (Add a new tracked topic)
+/discussion removetopic                              (Remove a tracked topic)
+/discussion stop                                     (Stop automatic discussion creation)
+/discussion start                                    (Resume automatic discussion creation)
+/discussion unsuppress                               (Allow purged papers to be auto-created again)
+/discussion purge                                    (Delete some or all discussion threads)
 
 /ctf createctf                                       (Create a new CTF)
 /ctf renamectf                                       (Rename a CTF)
