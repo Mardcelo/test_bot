@@ -1,8 +1,11 @@
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 import discord
+from pymongo.errors import DuplicateKeyError
 
 from config import (
     DBNAME,
@@ -20,6 +23,9 @@ from lib.util import sanitize_channel_name, truncate
 from msg_components.buttons.discussion import DiscussionButton
 
 _log = logging.getLogger("discord.eruditus.eprint.sync")
+DISCUSSION_LOCK_TIMEOUT = timedelta(minutes=10)
+DISCUSSION_LOCK_WAIT_SECONDS = 30
+DISCUSSION_LOCK_POLL_SECONDS = 0.5
 
 
 def format_discussion_locations(discussion: dict[str, Any] | None = None) -> str:
@@ -37,6 +43,79 @@ def format_discussion_locations(discussion: dict[str, Any] | None = None) -> str
         "\n".join(locations)
         if locations
         else ("Use the button below to join the private thread.")
+    )
+
+
+def _discussion_lock_collection_name() -> str:
+    """Return the collection name used for cross-process discussion locks."""
+    return f"{DISCUSSION_COLLECTION}_lock"
+
+
+def _parse_lock_expiry(value: Any) -> datetime | None:
+    """Parse a stored lock-expiry timestamp."""
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _try_acquire_discussion_lock(paper_id: str, token: str, now: datetime) -> bool:
+    """Try to acquire the per-paper discussion lock."""
+    collection = MONGO[DBNAME][_discussion_lock_collection_name()]
+    lock_doc = {
+        "_id": paper_id,
+        "token": token,
+        "expires_at": (now + DISCUSSION_LOCK_TIMEOUT).isoformat(),
+    }
+
+    try:
+        collection.insert_one(lock_doc)
+        return True
+    except DuplicateKeyError:
+        existing = collection.find_one({"_id": paper_id})
+        if existing is None:
+            return False
+
+        expires_at = _parse_lock_expiry(existing.get("expires_at"))
+        if expires_at is not None and expires_at > now:
+            return False
+
+        replaced = collection.replace_one(
+            {
+                "_id": paper_id,
+                "token": existing.get("token"),
+                "expires_at": existing.get("expires_at"),
+            },
+            lock_doc,
+        )
+        return replaced.modified_count == 1
+
+
+async def acquire_discussion_lock(paper_id: str) -> str | None:
+    """Wait briefly for the per-paper discussion lock."""
+    token = uuid4().hex
+    deadline = datetime.now(timezone.utc) + timedelta(
+        seconds=DISCUSSION_LOCK_WAIT_SECONDS
+    )
+
+    while True:
+        now = datetime.now(timezone.utc)
+        if _try_acquire_discussion_lock(paper_id, token, now):
+            return token
+
+        if now >= deadline:
+            return None
+
+        await asyncio.sleep(DISCUSSION_LOCK_POLL_SECONDS)
+
+
+def release_discussion_lock(paper_id: str, token: str) -> None:
+    """Release the per-paper discussion lock held by this process."""
+    MONGO[DBNAME][_discussion_lock_collection_name()].delete_one(
+        {"_id": paper_id, "token": token}
     )
 
 
@@ -405,201 +484,213 @@ async def ensure_discussion_for_paper(
     feed_channel: discord.TextChannel | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Create or repair the discussion objects for a paper."""
-    if paper["withdrawn"]:
-        discussion = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one(
-            {"_id": paper["_id"]}
+    lock_token = await acquire_discussion_lock(paper["_id"])
+    if lock_token is None:
+        _log.warning(
+            "Timed out waiting for the discussion lock for %s; reusing stored state.",
+            paper["_id"],
         )
-        if not discussion:
-            return None, False
-    feed_channel = feed_channel or await ensure_discussion_feed_channel(guild)
-    forum_channel = await ensure_discussion_forum_channel(guild)
+        existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
+        return existing, False
 
-    existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
-    now = datetime.now(timezone.utc).isoformat()
-    thread = await resolve_thread(
-        client, guild, existing["thread_id"] if existing else None
-    )
-    forum_thread = await resolve_thread(
-        client, guild, existing.get("forum_thread_id") if existing else None
-    )
-    created = existing is None
-
-    if thread is None and not paper["withdrawn"]:
-        thread = await feed_channel.create_thread(
-            name=build_thread_name(paper),
-            invitable=False,
-            auto_archive_duration=10080,
-        )
-
-    text_discussion = {
-        "thread_id": thread.id if thread else None,
-        "forum_thread_id": forum_thread.id if forum_thread else None,
-    }
-
-    if forum_channel is not None:
-        forum_tags = await ensure_forum_tags(forum_channel, paper)
-        forum_message = None
-        if forum_thread is None and not paper["withdrawn"]:
-            try:
-                forum_thread, forum_message = await forum_channel.create_thread(
-                    name=build_thread_name(paper),
-                    embed=build_discussion_embed(paper, discussion=text_discussion),
-                    applied_tags=forum_tags,
-                    view=DiscussionButton(
-                        paper_id=paper["_id"],
-                        disabled=paper["withdrawn"] or thread is None,
-                    ),
-                    auto_archive_duration=10080,
-                    reason="Create the mirrored ePrint forum post.",
-                )
-                text_discussion["forum_thread_id"] = forum_thread.id
-            except (discord.Forbidden, discord.HTTPException) as err:
-                _log.warning(
-                    "Unable to create forum post for %s in %s: %s",
-                    paper["_id"],
-                    forum_channel.id,
-                    err,
-                )
-                forum_thread = None
-        elif forum_thread is not None:
-            try:
-                await forum_thread.edit(
-                    name=build_thread_name(paper),
-                    applied_tags=forum_tags,
-                )
-            except (discord.Forbidden, discord.HTTPException) as err:
-                _log.warning(
-                    "Unable to update forum thread %s for %s: %s",
-                    forum_thread.id,
-                    paper["_id"],
-                    err,
-                )
-
-            forum_message = await resolve_thread_message(
-                forum_thread, existing.get("forum_message_id") if existing else None
+    try:
+        if paper["withdrawn"]:
+            discussion = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one(
+                {"_id": paper["_id"]}
             )
-    else:
-        forum_message = None
+            if not discussion:
+                return None, False
+        feed_channel = feed_channel or await ensure_discussion_feed_channel(guild)
+        forum_channel = await ensure_discussion_forum_channel(guild)
 
-    if existing:
-        message = await resolve_message(
-            feed_channel, existing.get("announcement_message_id")
+        existing = MONGO[DBNAME][DISCUSSION_COLLECTION].find_one({"_id": paper["_id"]})
+        now = datetime.now(timezone.utc).isoformat()
+        thread = await resolve_thread(
+            client, guild, existing["thread_id"] if existing else None
         )
-    else:
-        message = None
+        forum_thread = await resolve_thread(
+            client, guild, existing.get("forum_thread_id") if existing else None
+        )
+        created = existing is None
 
-    message = await upsert_announcement_message(
-        feed_channel,
-        message,
-        embed=build_discussion_embed(
-            paper,
-            discussion=text_discussion,
-            include_abstract=False,
-        ),
-        view=DiscussionButton(
-            paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
-        ),
-    )
+        if thread is None and not paper["withdrawn"]:
+            thread = await feed_channel.create_thread(
+                name=build_thread_name(paper),
+                invitable=False,
+                auto_archive_duration=10080,
+            )
 
-    if thread is not None:
-        thread_context_message = await resolve_thread_context_message(
-            thread,
-            existing.get("thread_context_message_id") if existing else None,
-            client.user.id if client.user else None,
-        )
-        thread_context_message = await upsert_thread_context_message(
-            thread,
-            thread_context_message,
-            embed=build_thread_context_embed(paper, feed_channel),
-        )
-    else:
-        thread_context_message = None
+        text_discussion = {
+            "thread_id": thread.id if thread else None,
+            "forum_thread_id": forum_thread.id if forum_thread else None,
+        }
 
-    if forum_thread is not None:
-        forum_message = forum_message or await resolve_thread_message(
-            forum_thread, existing.get("forum_message_id") if existing else None
-        )
-        if forum_message is not None:
-            try:
-                await forum_message.edit(
-                    embed=build_discussion_embed(
-                        paper,
-                        discussion={
-                            "thread_id": thread.id if thread else None,
-                            "forum_thread_id": forum_thread.id,
-                        },
-                    ),
-                    view=DiscussionButton(
-                        paper_id=paper["_id"],
-                        disabled=paper["withdrawn"] or thread is None,
-                    ),
-                )
-            except (discord.Forbidden, discord.HTTPException) as err:
-                if _is_old_message_edit_limit(err):
-                    _log.warning(
-                        "Forum starter message %s for %s hit Discord's old-message "
-                        "edit limit; keeping the existing starter message.",
-                        forum_message.id,
-                        paper["_id"],
+        if forum_channel is not None:
+            forum_tags = await ensure_forum_tags(forum_channel, paper)
+            forum_message = None
+            if forum_thread is None and not paper["withdrawn"]:
+                try:
+                    forum_thread, forum_message = await forum_channel.create_thread(
+                        name=build_thread_name(paper),
+                        embed=build_discussion_embed(paper, discussion=text_discussion),
+                        applied_tags=forum_tags,
+                        view=DiscussionButton(
+                            paper_id=paper["_id"],
+                            disabled=paper["withdrawn"] or thread is None,
+                        ),
+                        auto_archive_duration=10080,
+                        reason="Create the mirrored ePrint forum post.",
                     )
-                else:
+                    text_discussion["forum_thread_id"] = forum_thread.id
+                except (discord.Forbidden, discord.HTTPException) as err:
                     _log.warning(
-                        "Unable to update forum starter message %s for %s: %s",
-                        forum_message.id,
+                        "Unable to create forum post for %s in %s: %s",
+                        paper["_id"],
+                        forum_channel.id,
+                        err,
+                    )
+                    forum_thread = None
+            elif forum_thread is not None:
+                try:
+                    await forum_thread.edit(
+                        name=build_thread_name(paper),
+                        applied_tags=forum_tags,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    _log.warning(
+                        "Unable to update forum thread %s for %s: %s",
+                        forum_thread.id,
                         paper["_id"],
                         err,
                     )
 
-    discussion = {
-        "_id": paper["_id"],
-        "paper_id": paper["_id"],
-        "thread_id": thread.id if thread else None,
-        "thread_context_message_id": (
-            thread_context_message.id
-            if thread_context_message
-            else existing.get("thread_context_message_id")
-            if existing
-            else None
-        ),
-        "announcement_message_id": message.id,
-        "feed_channel_id": feed_channel.id,
-        "forum_thread_id": forum_thread.id if forum_thread else None,
-        "forum_message_id": (
-            forum_message.id
-            if forum_message
-            else existing.get("forum_message_id")
-            if existing
-            else None
-        ),
-        "forum_channel_id": (
-            forum_channel.id
-            if forum_channel
-            else existing.get("forum_channel_id")
-            if existing
-            else None
-        ),
-        "member_ids": existing["member_ids"] if existing else [],
-        "status": "withdrawn" if paper["withdrawn"] else "active",
-        "created_at": existing["created_at"] if existing else now,
-        "updated_at": now,
-    }
+                forum_message = await resolve_thread_message(
+                    forum_thread, existing.get("forum_message_id") if existing else None
+                )
+        else:
+            forum_message = None
 
-    MONGO[DBNAME][DISCUSSION_COLLECTION].replace_one(
-        {"_id": discussion["_id"]}, discussion, upsert=True
-    )
+        if existing:
+            message = await resolve_message(
+                feed_channel, existing.get("announcement_message_id")
+            )
+        else:
+            message = None
 
-    if thread is not None:
-        await thread.edit(name=build_thread_name(paper))
-        for member_id in discussion["member_ids"]:
-            member = guild.get_member(member_id)
-            if member is None:
+        message = await upsert_announcement_message(
+            feed_channel,
+            message,
+            embed=build_discussion_embed(
+                paper,
+                discussion=text_discussion,
+                include_abstract=False,
+            ),
+            view=DiscussionButton(
+                paper_id=paper["_id"], disabled=paper["withdrawn"] or thread is None
+            ),
+        )
+
+        if thread is not None:
+            thread_context_message = await resolve_thread_context_message(
+                thread,
+                existing.get("thread_context_message_id") if existing else None,
+                client.user.id if client.user else None,
+            )
+            thread_context_message = await upsert_thread_context_message(
+                thread,
+                thread_context_message,
+                embed=build_thread_context_embed(paper, feed_channel),
+            )
+        else:
+            thread_context_message = None
+
+        if forum_thread is not None:
+            forum_message = forum_message or await resolve_thread_message(
+                forum_thread, existing.get("forum_message_id") if existing else None
+            )
+            if forum_message is not None:
                 try:
-                    member = await guild.fetch_member(member_id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-            await thread.add_user(member)
+                    await forum_message.edit(
+                        embed=build_discussion_embed(
+                            paper,
+                            discussion={
+                                "thread_id": thread.id if thread else None,
+                                "forum_thread_id": forum_thread.id,
+                            },
+                        ),
+                        view=DiscussionButton(
+                            paper_id=paper["_id"],
+                            disabled=paper["withdrawn"] or thread is None,
+                        ),
+                    )
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    if _is_old_message_edit_limit(err):
+                        _log.warning(
+                            "Forum starter message %s for %s hit Discord's old-message "
+                            "edit limit; keeping the existing starter message.",
+                            forum_message.id,
+                            paper["_id"],
+                        )
+                    else:
+                        _log.warning(
+                            "Unable to update forum starter message %s for %s: %s",
+                            forum_message.id,
+                            paper["_id"],
+                            err,
+                        )
 
-    return discussion, created
+        discussion = {
+            "_id": paper["_id"],
+            "paper_id": paper["_id"],
+            "thread_id": thread.id if thread else None,
+            "thread_context_message_id": (
+                thread_context_message.id
+                if thread_context_message
+                else existing.get("thread_context_message_id")
+                if existing
+                else None
+            ),
+            "announcement_message_id": message.id,
+            "feed_channel_id": feed_channel.id,
+            "forum_thread_id": forum_thread.id if forum_thread else None,
+            "forum_message_id": (
+                forum_message.id
+                if forum_message
+                else existing.get("forum_message_id")
+                if existing
+                else None
+            ),
+            "forum_channel_id": (
+                forum_channel.id
+                if forum_channel
+                else existing.get("forum_channel_id")
+                if existing
+                else None
+            ),
+            "member_ids": existing["member_ids"] if existing else [],
+            "status": "withdrawn" if paper["withdrawn"] else "active",
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+        }
+
+        MONGO[DBNAME][DISCUSSION_COLLECTION].replace_one(
+            {"_id": discussion["_id"]}, discussion, upsert=True
+        )
+
+        if thread is not None:
+            await thread.edit(name=build_thread_name(paper))
+            for member_id in discussion["member_ids"]:
+                member = guild.get_member(member_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(member_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        continue
+                await thread.add_user(member)
+
+        return discussion, created
+    finally:
+        release_discussion_lock(paper["_id"], lock_token)
 
 
 async def sync_recent_papers(
