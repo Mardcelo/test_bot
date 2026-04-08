@@ -22,21 +22,21 @@ from lib.discord_util import (
     remove_discussion_member,
 )
 from lib.eprint.scraper import normalize_eprint_id
-from lib.eprint.tagger import (
-    add_tracked_topic,
-    get_tracked_topics,
-    normalize_topic_name,
-    remove_tracked_topic,
-)
 from lib.eprint.sync import (
     discussion_auto_add_enabled,
-    ensure_discussion_for_paper,
     ensure_discussion_feed_channel,
+    ensure_discussion_for_paper,
     format_topic_tags,
     resolve_message,
     resolve_thread,
     set_discussion_auto_add_enabled,
     sync_recent_papers,
+)
+from lib.eprint.tagger import (
+    add_tracked_topic,
+    get_tracked_topics,
+    normalize_topic_name,
+    remove_tracked_topic,
 )
 from lib.util import get_discussion_info, get_paper_info, truncate
 from msg_components.buttons.discussion import LeaveDiscussionButton

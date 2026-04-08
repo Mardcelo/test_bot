@@ -1,11 +1,6 @@
 import re
 
-from config import (
-    DBNAME,
-    DISCUSSION_SETTINGS_COLLECTION,
-    EPRINT_TRACKED_TOPICS,
-    MONGO,
-)
+from config import DBNAME, DISCUSSION_SETTINGS_COLLECTION, EPRINT_TRACKED_TOPICS, MONGO
 
 TAG_PATTERNS: dict[str, tuple[str, ...]] = {
     "isogeny": (

@@ -10,12 +10,7 @@ from xml.etree import ElementTree as ET
 import aiohttp
 from bs4 import BeautifulSoup
 
-from config import (
-    EPRINT_CACHE_PATH,
-    EPRINT_JSON_URL,
-    EPRINT_LOOKBACK_DAYS,
-    USER_AGENT,
-)
+from config import EPRINT_CACHE_PATH, EPRINT_JSON_URL, EPRINT_LOOKBACK_DAYS, USER_AGENT
 from lib.eprint.tagger import derive_topic_tags, get_tracked_topics
 
 _log = logging.getLogger("discord.eruditus.eprint.scraper")
