@@ -248,8 +248,11 @@ async def ensure_discussion_feed_channel(guild: discord.Guild) -> discord.TextCh
         channel = await resolve_guild_channel(guild, DISCUSSION_CHANNEL)
         if isinstance(channel, discord.TextChannel):
             return channel
-        raise RuntimeError(
-            "DISCUSSION_CHANNEL is set but does not point to a text channel."
+        _log.warning(
+            "DISCUSSION_CHANNEL=%s is set but does not point to a text channel; "
+            "falling back to #%s.",
+            DISCUSSION_CHANNEL,
+            EPRINT_FEED_CHANNEL_NAME,
         )
 
     for channel in guild.text_channels:

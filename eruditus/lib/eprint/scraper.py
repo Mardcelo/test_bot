@@ -1,21 +1,39 @@
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from xml.etree import ElementTree as ET
 
 import aiohttp
 from bs4 import BeautifulSoup
 
-from config import EPRINT_CACHE_PATH, EPRINT_JSON_URL, EPRINT_LOOKBACK_DAYS, USER_AGENT
+try:
+    from scrapling.fetchers import FetcherSession
+except ImportError:  # pragma: no cover - exercised only before dependencies install.
+    FetcherSession = None
+else:
+    logging.getLogger("scrapling").setLevel(logging.WARNING)
+
+from config import EPRINT_CACHE_PATH, EPRINT_JSON_URL, EPRINT_LOOKBACK_DAYS
 from lib.eprint.tagger import derive_topic_tags, get_tracked_topics
 
 _log = logging.getLogger("discord.eruditus.eprint.scraper")
 DC_NAMESPACE = {"dc": "http://purl.org/dc/elements/1.1/"}
 PAPER_ID_RE = re.compile(r"(\d{4}/\d+)")
+CHARSET_RE = re.compile(r"charset=([^\s;]+)", re.IGNORECASE)
+EPRINT_FALLBACK_HEADERS = {
+    "Accept": "application/rss+xml, application/xml, text/html;q=0.9, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+EPRINT_FETCHER_KIND = tuple[str, Any]
 
 
 def parse_eprint_datetime(value: str) -> datetime:
@@ -33,6 +51,79 @@ def _compact_whitespace(value: str | None) -> str:
         return ""
 
     return " ".join(value.replace("\r", " ").replace("\n", " ").split())
+
+
+def _decode_response_body(body: bytes | str, headers: dict[str, Any]) -> str:
+    """Decode a response body using its declared charset when present."""
+    if isinstance(body, str):
+        return body
+
+    content_type = str(
+        headers.get("content-type") or headers.get("Content-Type") or ""
+    )
+    match = CHARSET_RE.search(content_type)
+    charset = match.group(1).strip("\"'") if match else "utf-8"
+    return body.decode(charset, errors="replace")
+
+
+@asynccontextmanager
+async def _open_scrapling_fetcher() -> AsyncIterator[EPRINT_FETCHER_KIND]:
+    """Open a Scrapling HTTP session for ePrint requests."""
+    if FetcherSession is None:
+        raise aiohttp.ClientError("Scrapling is not installed")
+
+    async with FetcherSession(
+        impersonate="chrome",
+        stealthy_headers=True,
+        timeout=60,
+        retries=3,
+        follow_redirects="safe",
+    ) as session:
+        yield ("scrapling", session)
+
+
+@asynccontextmanager
+async def _open_aiohttp_fetcher() -> AsyncIterator[EPRINT_FETCHER_KIND]:
+    """Open the legacy aiohttp session used as a fallback fetcher."""
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=EPRINT_FALLBACK_HEADERS,
+    ) as session:
+        yield ("aiohttp", session)
+
+
+async def _fetch_text(
+    fetcher: EPRINT_FETCHER_KIND,
+    url: str,
+    *,
+    allow_404: bool = False,
+) -> str | None:
+    """Fetch a URL through the active ePrint fetcher."""
+    kind, session = fetcher
+
+    if kind == "scrapling":
+        try:
+            page = await session.get(url)
+        except Exception as err:
+            raise aiohttp.ClientError(
+                f"Scrapling request failed for {url}: {err}"
+            ) from err
+
+        status = int(getattr(page, "status", 0) or 0)
+        if status == 404 and allow_404:
+            return None
+        if status >= 400:
+            raise aiohttp.ClientError(f"ePrint returned HTTP {status} for {url}")
+
+        return _decode_response_body(page.body, page.headers)
+
+    async with session.get(url) as response:
+        if response.status == 404 and allow_404:
+            return None
+
+        response.raise_for_status()
+        return await response.text()
 
 
 def _normalize_authors(value: Any) -> list[str]:
@@ -327,41 +418,64 @@ async def fetch_recent_papers(days: int | None = None) -> list[dict[str, Any]]:
     """Fetch recent tracked papers from the official ePrint JSON feed."""
     lookback_days = max(1, min(days or EPRINT_LOOKBACK_DAYS, EPRINT_LOOKBACK_DAYS))
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    timeout = aiohttp.ClientTimeout(total=60)
 
-    papers = []
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(
-            EPRINT_JSON_URL, headers={"User-Agent": USER_AGENT()}
-        ) as response:
-            response.raise_for_status()
-            payload = await response.text()
-
-        raw_papers = parse_rss_feed(payload)
-        for raw_paper in raw_papers:
-            normalized = normalize_paper(raw_paper)
-            if normalized is None:
-                continue
-
-            try:
-                lastmodified = parse_eprint_datetime(normalized["lastmodified"])
-            except ValueError:
-                _log.warning(
-                    "Skipping paper with invalid timestamp: %s", normalized["_id"]
-                )
-                continue
-
-            if lastmodified < cutoff:
-                continue
-
-            page_paper = await fetch_paper_by_id(normalized["_id"], session=session)
-            if page_paper is not None:
-                normalized = page_paper
-
-            papers.append(normalized)
+    try:
+        async with _open_scrapling_fetcher() as fetcher:
+            papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
+    except aiohttp.ClientError as err:
+        _log.warning("Scrapling ePrint fetch failed; falling back to aiohttp: %s", err)
+        async with _open_aiohttp_fetcher() as fetcher:
+            papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
 
     papers.sort(key=lambda paper: paper["lastmodified"], reverse=True)
     write_snapshot(papers, lookback_days=lookback_days)
+    return papers
+
+
+async def _fetch_recent_papers_with_fetcher(
+    fetcher: EPRINT_FETCHER_KIND,
+    cutoff: datetime,
+) -> list[dict[str, Any]]:
+    """Fetch recent papers with the provided ePrint fetcher."""
+    payload = await _fetch_text(fetcher, EPRINT_JSON_URL)
+    if payload is None:
+        return []
+
+    papers = []
+    for raw_paper in parse_rss_feed(payload):
+        normalized = normalize_paper(raw_paper)
+        if normalized is None:
+            continue
+
+        try:
+            lastmodified = parse_eprint_datetime(normalized["lastmodified"])
+        except ValueError:
+            _log.warning(
+                "Skipping paper with invalid timestamp: %s", normalized["_id"]
+            )
+            continue
+
+        if lastmodified < cutoff:
+            continue
+
+        try:
+            page_paper = await _fetch_paper_by_id_with_fetcher(
+                normalized["_id"],
+                fetcher,
+                require_tracked_topics=False,
+            )
+        except aiohttp.ClientError as err:
+            _log.warning("Failed to fetch ePrint page %s: %s", normalized["_id"], err)
+            page_paper = None
+        if page_paper is not None:
+            if not page_paper.get("topic_tags"):
+                page_paper["topic_tags"] = normalized["topic_tags"]
+                page_paper["source_hash"] = _build_source_hash(page_paper)
+
+            normalized = page_paper
+
+        papers.append(normalized)
+
     return papers
 
 
@@ -373,29 +487,53 @@ async def fetch_paper_by_id(
     if eprint_id is None:
         return None
 
-    owns_session = session is None
     if session is None:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+        try:
+            async with _open_scrapling_fetcher() as fetcher:
+                return await _fetch_paper_by_id_with_fetcher(
+                    eprint_id,
+                    fetcher,
+                    require_tracked_topics=False,
+                )
+        except aiohttp.ClientError as err:
+            _log.warning(
+                "Scrapling ePrint paper fetch failed; falling back to aiohttp: %s",
+                err,
+            )
+            async with _open_aiohttp_fetcher() as fetcher:
+                return await _fetch_paper_by_id_with_fetcher(
+                    eprint_id,
+                    fetcher,
+                    require_tracked_topics=False,
+                )
 
-    try:
-        async with session.get(
-            f"https://eprint.iacr.org/{eprint_id}",
-            headers={"User-Agent": USER_AGENT()},
-        ) as response:
-            if response.status == 404:
-                return None
+    return await _fetch_paper_by_id_with_fetcher(
+        eprint_id,
+        ("aiohttp", session),
+        require_tracked_topics=False,
+    )
 
-            response.raise_for_status()
-            html = await response.text()
 
-        raw_paper = parse_paper_page(html, eprint_id)
-        if raw_paper is None:
-            return None
+async def _fetch_paper_by_id_with_fetcher(
+    eprint_id: str,
+    fetcher: EPRINT_FETCHER_KIND,
+    *,
+    require_tracked_topics: bool,
+) -> dict[str, Any] | None:
+    """Fetch and normalize a single ePrint paper using an open fetcher."""
+    html = await _fetch_text(
+        fetcher,
+        f"https://eprint.iacr.org/{eprint_id}",
+        allow_404=True,
+    )
+    if html is None:
+        return None
 
-        return normalize_paper(
-            raw_paper,
-            require_tracked_topics=False,
-        )
-    finally:
-        if owns_session:
-            await session.close()
+    raw_paper = parse_paper_page(html, eprint_id)
+    if raw_paper is None:
+        return None
+
+    return normalize_paper(
+        raw_paper,
+        require_tracked_topics=require_tracked_topics,
+    )

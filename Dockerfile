@@ -1,4 +1,4 @@
-FROM python:3.10
+FROM python:3.10-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN dpkg --print-architecture | tee /tmp/arch
@@ -9,7 +9,7 @@ ENV DOTNET_RUNNING_IN_CONTAINER=true \
 
 RUN if [ "$(cat /tmp/arch)" = "amd64" ]; then \
         set -xe \
-        && wget https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb -O packages-microsoft-prod.deb \
+        && wget https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -O packages-microsoft-prod.deb \
         && dpkg -i packages-microsoft-prod.deb \
         && rm packages-microsoft-prod.deb \
         && apt-get update \
