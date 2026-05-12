@@ -58,9 +58,7 @@ def _decode_response_body(body: bytes | str, headers: dict[str, Any]) -> str:
     if isinstance(body, str):
         return body
 
-    content_type = str(
-        headers.get("content-type") or headers.get("Content-Type") or ""
-    )
+    content_type = str(headers.get("content-type") or headers.get("Content-Type") or "")
     match = CHARSET_RE.search(content_type)
     charset = match.group(1).strip("\"'") if match else "utf-8"
     return body.decode(charset, errors="replace")
@@ -450,9 +448,7 @@ async def _fetch_recent_papers_with_fetcher(
         try:
             lastmodified = parse_eprint_datetime(normalized["lastmodified"])
         except ValueError:
-            _log.warning(
-                "Skipping paper with invalid timestamp: %s", normalized["_id"]
-            )
+            _log.warning("Skipping paper with invalid timestamp: %s", normalized["_id"])
             continue
 
         if lastmodified < cutoff:
