@@ -13,8 +13,9 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 try:
-    from scrapling.fetchers import FetcherSession
+    from scrapling.fetchers import AsyncStealthySession, FetcherSession
 except ImportError:  # pragma: no cover - exercised only before dependencies install.
+    AsyncStealthySession = None
     FetcherSession = None
 else:
     logging.getLogger("scrapling").setLevel(logging.WARNING)
@@ -36,6 +37,11 @@ EPRINT_FALLBACK_HEADERS = {
 }
 EPRINT_FETCHER_KIND = tuple[str, Any]
 EPRINT_FETCH_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError)
+EPRINT_BLOCK_MARKERS = (
+    "Attention Required! | Cloudflare",
+    "Sorry, you have been blocked",
+    "cf-error-details",
+)
 
 
 def parse_eprint_datetime(value: str) -> datetime:
@@ -66,6 +72,11 @@ def _decode_response_body(body: bytes | str, headers: dict[str, Any]) -> str:
     return body.decode(charset, errors="replace")
 
 
+def _raise_if_blocked(text: str, url: str) -> None:
+    if any(marker in text for marker in EPRINT_BLOCK_MARKERS):
+        raise aiohttp.ClientError(f"ePrint Cloudflare block page returned for {url}")
+
+
 @asynccontextmanager
 async def _open_scrapling_fetcher() -> AsyncIterator[EPRINT_FETCHER_KIND]:
     """Open a Scrapling HTTP session for ePrint requests."""
@@ -80,6 +91,27 @@ async def _open_scrapling_fetcher() -> AsyncIterator[EPRINT_FETCHER_KIND]:
         follow_redirects="safe",
     ) as session:
         yield ("scrapling", session)
+
+
+@asynccontextmanager
+async def _open_stealthy_fetcher() -> AsyncIterator[EPRINT_FETCHER_KIND]:
+    """Open a browser-backed Scrapling session for Cloudflare-protected ePrint."""
+    if AsyncStealthySession is None:
+        raise aiohttp.ClientError("Scrapling stealth fetcher is not installed")
+
+    try:
+        async with AsyncStealthySession(
+            headless=True,
+            block_webrtc=True,
+            disable_resources=True,
+            solve_cloudflare=True,
+            timeout=90000,
+            wait=1000,
+            max_pages=1,
+        ) as session:
+            yield ("stealthy", session)
+    except Exception as err:
+        raise aiohttp.ClientError(f"Scrapling stealth session failed: {err}") from err
 
 
 @asynccontextmanager
@@ -116,14 +148,36 @@ async def _fetch_text(
         if status >= 400:
             raise aiohttp.ClientError(f"ePrint returned HTTP {status} for {url}")
 
-        return _decode_response_body(page.body, page.headers)
+        text = _decode_response_body(page.body, page.headers)
+        _raise_if_blocked(text, url)
+        return text
+
+    if kind == "stealthy":
+        try:
+            page = await session.fetch(url, solve_cloudflare=True)
+        except Exception as err:
+            raise aiohttp.ClientError(
+                f"Scrapling stealth request failed for {url}: {err}"
+            ) from err
+
+        status = int(getattr(page, "status", 0) or 0)
+        if status == 404 and allow_404:
+            return None
+        if status >= 400:
+            raise aiohttp.ClientError(f"ePrint returned HTTP {status} for {url}")
+
+        text = _decode_response_body(page.body, page.headers)
+        _raise_if_blocked(text, url)
+        return text
 
     async with session.get(url) as response:
         if response.status == 404 and allow_404:
             return None
 
         response.raise_for_status()
-        return await response.text()
+        text = await response.text()
+        _raise_if_blocked(text, url)
+        return text
 
 
 def _normalize_authors(value: Any) -> list[str]:
@@ -456,22 +510,32 @@ async def fetch_recent_papers(days: int | None = None) -> list[dict[str, Any]]:
         async with _open_scrapling_fetcher() as fetcher:
             papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
     except EPRINT_FETCH_ERRORS as err:
-        _log.warning("Scrapling ePrint fetch failed; falling back to aiohttp: %s", err)
+        _log.warning(
+            "Scrapling ePrint fetch failed; falling back to stealth browser: %s", err
+        )
         try:
-            async with _open_aiohttp_fetcher() as fetcher:
+            async with _open_stealthy_fetcher() as fetcher:
                 papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
-        except EPRINT_FETCH_ERRORS as fallback_err:
-            cached_papers = read_snapshot(cutoff)
-            if cached_papers is not None:
-                _log.warning(
-                    "Using cached ePrint snapshot because live fetch failed: %s",
-                    fallback_err,
-                )
-                return cached_papers
+        except EPRINT_FETCH_ERRORS as stealth_err:
+            _log.warning(
+                "Stealth ePrint fetch failed; falling back to aiohttp: %s",
+                stealth_err,
+            )
+            try:
+                async with _open_aiohttp_fetcher() as fetcher:
+                    papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
+            except EPRINT_FETCH_ERRORS as fallback_err:
+                cached_papers = read_snapshot(cutoff)
+                if cached_papers is not None:
+                    _log.warning(
+                        "Using cached ePrint snapshot because live fetch failed: %s",
+                        fallback_err,
+                    )
+                    return cached_papers
 
-            raise aiohttp.ClientError(
-                "Live ePrint fetch failed and no cached snapshot is available"
-            ) from fallback_err
+                raise aiohttp.ClientError(
+                    "Live ePrint fetch failed and no cached snapshot is available"
+                ) from fallback_err
 
     papers.sort(key=lambda paper: paper["lastmodified"], reverse=True)
     write_snapshot(papers, lookback_days=lookback_days)
@@ -538,18 +602,30 @@ async def fetch_paper_by_id(
                     eprint_id,
                     fetcher,
                     require_tracked_topics=False,
-                )
+            )
         except aiohttp.ClientError as err:
             _log.warning(
-                "Scrapling ePrint paper fetch failed; falling back to aiohttp: %s",
+                "Static ePrint paper fetch failed; falling back to stealth browser: %s",
                 err,
             )
-            async with _open_aiohttp_fetcher() as fetcher:
-                return await _fetch_paper_by_id_with_fetcher(
-                    eprint_id,
-                    fetcher,
-                    require_tracked_topics=False,
+            try:
+                async with _open_stealthy_fetcher() as fetcher:
+                    return await _fetch_paper_by_id_with_fetcher(
+                        eprint_id,
+                        fetcher,
+                        require_tracked_topics=False,
+                    )
+            except aiohttp.ClientError as stealth_err:
+                _log.warning(
+                    "Stealth ePrint paper fetch failed; falling back to aiohttp: %s",
+                    stealth_err,
                 )
+                async with _open_aiohttp_fetcher() as fetcher:
+                    return await _fetch_paper_by_id_with_fetcher(
+                        eprint_id,
+                        fetcher,
+                        require_tracked_topics=False,
+                    )
 
     return await _fetch_paper_by_id_with_fetcher(
         eprint_id,

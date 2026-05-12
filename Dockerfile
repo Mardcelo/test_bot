@@ -43,6 +43,7 @@ RUN if [ "$(cat /tmp/arch)" = "amd64" ]; then \
 COPY requirements.txt .
 
 RUN pip3 install -r requirements.txt && \
+    scrapling install && \
     rm -f requirements.txt
 
 COPY eruditus /eruditus
