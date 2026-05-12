@@ -150,8 +150,9 @@ class Discussion(app_commands.Group):
             _log.warning("Failed to sync ePrint papers: %s", error)
             await interaction.followup.send(
                 (
-                    "Failed to fetch recent ePrint papers. Check the network "
-                    "and try again."
+                    "Failed to fetch recent ePrint papers from IACR ePrint. "
+                    "The site may be blocking automated requests, and no "
+                    "cached snapshot was available. Try again later."
                 ),
                 ephemeral=True,
             )

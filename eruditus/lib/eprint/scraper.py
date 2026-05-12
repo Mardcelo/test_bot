@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ EPRINT_FALLBACK_HEADERS = {
     ),
 }
 EPRINT_FETCHER_KIND = tuple[str, Any]
+EPRINT_FETCH_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError)
 
 
 def parse_eprint_datetime(value: str) -> datetime:
@@ -412,6 +414,39 @@ def write_snapshot(papers: list[dict[str, Any]], lookback_days: int) -> None:
         _log.warning("Unable to write ePrint cache snapshot %s: %s", cache_path, err)
 
 
+def read_snapshot(cutoff: datetime) -> list[dict[str, Any]] | None:
+    """Load a recent-paper snapshot when the live ePrint feed is unavailable."""
+    cache_path = Path(EPRINT_CACHE_PATH)
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as err:
+        _log.warning("Unable to read ePrint cache snapshot %s: %s", cache_path, err)
+        return None
+
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        _log.warning("Ignoring invalid ePrint cache snapshot %s", cache_path)
+        return None
+
+    recent_papers = []
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+
+        try:
+            lastmodified = parse_eprint_datetime(str(paper["lastmodified"]))
+        except (KeyError, ValueError):
+            continue
+
+        if lastmodified >= cutoff:
+            recent_papers.append(paper)
+
+    recent_papers.sort(key=lambda paper: paper["lastmodified"], reverse=True)
+    return recent_papers
+
+
 async def fetch_recent_papers(days: int | None = None) -> list[dict[str, Any]]:
     """Fetch recent tracked papers from the official ePrint JSON feed."""
     lookback_days = max(1, min(days or EPRINT_LOOKBACK_DAYS, EPRINT_LOOKBACK_DAYS))
@@ -420,10 +455,23 @@ async def fetch_recent_papers(days: int | None = None) -> list[dict[str, Any]]:
     try:
         async with _open_scrapling_fetcher() as fetcher:
             papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
-    except aiohttp.ClientError as err:
+    except EPRINT_FETCH_ERRORS as err:
         _log.warning("Scrapling ePrint fetch failed; falling back to aiohttp: %s", err)
-        async with _open_aiohttp_fetcher() as fetcher:
-            papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
+        try:
+            async with _open_aiohttp_fetcher() as fetcher:
+                papers = await _fetch_recent_papers_with_fetcher(fetcher, cutoff)
+        except EPRINT_FETCH_ERRORS as fallback_err:
+            cached_papers = read_snapshot(cutoff)
+            if cached_papers is not None:
+                _log.warning(
+                    "Using cached ePrint snapshot because live fetch failed: %s",
+                    fallback_err,
+                )
+                return cached_papers
+
+            raise aiohttp.ClientError(
+                "Live ePrint fetch failed and no cached snapshot is available"
+            ) from fallback_err
 
     papers.sort(key=lambda paper: paper["lastmodified"], reverse=True)
     write_snapshot(papers, lookback_days=lookback_days)
